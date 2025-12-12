@@ -7,6 +7,311 @@ import tempfile
 import zipfile
 import os
 import io
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from shapely.geometry import Point, MultiPoint
+from shapely.ops import unary_union
+from scipy.spatial import Voronoi
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from shapely.geometry import Point, MultiPoint
+from shapely.ops import unary_union
+from scipy.spatial import Voronoi
+from shapely.geometry import Polygon as ShapelyPolygon
+
+# Helper functions for road network analysis
+def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
+    """
+    Generate points along each road segment at specified spacing.
+    
+    Parameters:
+    - edges_gdf: GeoDataFrame of road edges
+    - spacing_miles: spacing between points in miles
+    
+    Returns:
+    - GeoDataFrame of points
+    """
+    points = []
+    edge_ids = []
+    
+    # Convert miles to meters (1 mile = 1609.34 meters)
+    spacing_meters = spacing_miles * 1609.34
+    
+    for idx, row in edges_gdf.iterrows():
+        line = row.geometry
+        line_length = line.length  # in meters
+        
+        # Calculate number of points needed
+        num_points = int(line_length / spacing_meters)
+        
+        if num_points > 0:
+            for i in range(num_points + 1):
+                distance = i * spacing_meters
+                if distance <= line_length:
+                    point = line.interpolate(distance)
+                    points.append(point)
+                    edge_ids.append(idx)
+    
+    # Create GeoDataFrame
+    points_gdf = gpd.GeoDataFrame({
+        'edge_id': edge_ids,
+        'geometry': points
+    }, crs=edges_gdf.crs)
+    
+    return points_gdf
+
+def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
+    """
+    Create polygons around clustered points using Voronoi diagrams.
+    
+    Parameters:
+    - points_gdf: GeoDataFrame of points
+    - n_clusters: number of clusters
+    - edges_gdf: original edges for boundary
+    
+    Returns:
+    - GeoDataFrame of cluster polygons
+    """
+    # Perform k-means clustering
+    coords = np.array([[p.x, p.y] for p in points_gdf.geometry])
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    points_gdf['cluster'] = kmeans.fit_predict(coords)
+    
+    # Get cluster centroids
+    centroids = kmeans.cluster_centers_
+    
+    # Create Voronoi diagram
+    vor = Voronoi(centroids)
+    
+    # Create polygons from Voronoi regions
+    polygons = []
+    cluster_ids = []
+    
+    # Get overall boundary
+    boundary = edges_gdf.unary_union.convex_hull.buffer(1000)  # 1km buffer
+    
+    for region_idx, region in enumerate(vor.regions):
+        if not region or -1 in region:
+            continue
+        
+        # Create polygon from Voronoi vertices
+        polygon_coords = [vor.vertices[i] for i in region]
+        if len(polygon_coords) >= 3:
+            poly = ShapelyPolygon(polygon_coords)
+            
+            # Clip to boundary
+            clipped_poly = poly.intersection(boundary)
+            
+            if not clipped_poly.is_empty and clipped_poly.area > 0:
+                polygons.append(clipped_poly)
+                cluster_ids.append(region_idx)
+    
+    # Create GeoDataFrame
+    cluster_gdf = gpd.GeoDataFrame({
+        'cluster_id': cluster_ids,
+        'geometry': polygons
+    }, crs=edges_gdf.crs)
+    
+    # Calculate stats for each cluster
+    cluster_stats = []
+    for cluster_id in range(n_clusters):
+        cluster_points = points_gdf[points_gdf['cluster'] == cluster_id]
+        cluster_edges = edges_gdf[edges_gdf.index.isin(cluster_points['edge_id'])]
+        
+        stats = {
+            'cluster_id': cluster_id,
+            'num_points': len(cluster_points),
+            'total_miles': cluster_edges['length_mi'].sum() if 'length_mi' in cluster_edges.columns else 0
+        }
+        cluster_stats.append(stats)
+    
+    stats_df = pd.DataFrame(cluster_stats)
+    cluster_gdf = cluster_gdf.merge(stats_df, on='cluster_id', how='left')
+    
+    return cluster_gdf, points_gdf
+
+def process_and_display_network(edges, nodes, enable_clustering=False, 
+                                target_miles_per_cluster=50, point_spacing=0.5,
+                                output_format="GeoJSON"):
+    """
+    Process network edges, optionally create clusters, display results and provide downloads.
+    
+    Returns the processed edges and cluster_gdf (if clustering enabled)
+    """
+    # Add miles field (convert meters to miles)
+    edges['length_mi'] = edges['length'] / 1609.34
+    total_miles = edges['length_mi'].sum()
+    
+    # Display stats
+    st.success("✅ Network extracted successfully!")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Nodes", f"{len(nodes):,}")
+    col2.metric("Edges", f"{len(edges):,}")
+    col3.metric("Total Miles", f"{total_miles:.2f}")
+    col4.metric("Total Length (km)", f"{edges['length'].sum()/1000:.2f}")
+    
+    # Perform clustering if enabled
+    cluster_gdf = None
+    points_gdf = None
+    if enable_clustering:
+        with st.spinner("Generating cluster analysis..."):
+            # Calculate number of clusters
+            n_clusters = max(1, int(np.ceil(total_miles / target_miles_per_cluster)))
+            
+            st.info(f"📊 Generating {n_clusters} clusters (Target: {target_miles_per_cluster} miles/cluster)")
+            
+            # Generate points along lines
+            points_gdf = generate_points_along_lines(edges, spacing_miles=point_spacing)
+            
+            # Create cluster polygons
+            cluster_gdf, points_gdf = create_cluster_polygons(points_gdf, n_clusters, edges)
+            
+            # Display clustering stats
+            st.success(f"✅ Created {n_clusters} clusters")
+            
+            cluster_stats_display = st.expander("📈 View Cluster Statistics")
+            with cluster_stats_display:
+                st.dataframe(cluster_gdf[['cluster_id', 'total_miles']].sort_values('cluster_id'))
+    
+    # Create map
+    st.subheader("Network Preview")
+    map_center = [nodes.geometry.y.mean(), nodes.geometry.x.mean()]
+    m = folium.Map(location=map_center, zoom_start=13)
+    
+    # Add cluster polygons if enabled
+    if enable_clustering and cluster_gdf is not None:
+        # Define color palette for clusters
+        colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 
+                 'lightred', 'beige', 'darkblue', 'darkgreen', 'cadetblue', 
+                 'darkpurple', 'pink', 'lightblue', 'lightgreen', 'gray', 
+                 'black', 'lightgray']
+        
+        for idx, row in cluster_gdf.iterrows():
+            color = colors[int(row['cluster_id']) % len(colors)]
+            folium.GeoJson(
+                row.geometry,
+                style_function=lambda x, color=color: {
+                    'fillColor': color,
+                    'color': color,
+                    'weight': 2,
+                    'fillOpacity': 0.2
+                },
+                tooltip=f"Cluster {int(row['cluster_id'])}: {row['total_miles']:.1f} miles"
+            ).add_to(m)
+    
+    # Sample edges if too many (for performance)
+    edges_to_plot = edges.sample(min(1000, len(edges)))
+    
+    # Add edges to map
+    for idx, row in edges_to_plot.iterrows():
+        coords = list(row.geometry.coords)
+        folium.PolyLine(
+            locations=[(coord[1], coord[0]) for coord in coords],
+            color='blue',
+            weight=2,
+            opacity=0.6
+        ).add_to(m)
+    
+    if len(edges) > 1000:
+        st.info(f"📍 Showing 1,000 of {len(edges):,} edges for performance")
+    
+    folium_static(m, width=700, height=500)
+    
+    # Prepare download
+    st.subheader("Download Your Data")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if output_format == "Shapefile":
+            shp_path = os.path.join(tmpdir, "roads.shp")
+            edges.to_file(shp_path, driver='ESRI Shapefile')
+            
+            # Zip the shapefile components
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
+                    file_path = os.path.join(tmpdir, f"roads{ext}")
+                    if os.path.exists(file_path):
+                        zipf.write(file_path, f"roads{ext}")
+            
+            zip_buffer.seek(0)
+            st.download_button(
+                label="📥 Download Roads Shapefile (ZIP)",
+                data=zip_buffer,
+                file_name="roads.zip",
+                mime="application/zip"
+            )
+            
+            # Add cluster download if enabled
+            if enable_clustering and cluster_gdf is not None:
+                cluster_shp_path = os.path.join(tmpdir, "clusters.shp")
+                cluster_gdf.to_file(cluster_shp_path, driver='ESRI Shapefile')
+                
+                cluster_zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(cluster_zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
+                        file_path = os.path.join(tmpdir, f"clusters{ext}")
+                        if os.path.exists(file_path):
+                            zipf.write(file_path, f"clusters{ext}")
+                
+                cluster_zip_buffer.seek(0)
+                st.download_button(
+                    label="📥 Download Cluster Polygons Shapefile (ZIP)",
+                    data=cluster_zip_buffer,
+                    file_name="clusters.zip",
+                    mime="application/zip",
+                    key=f"cluster_shp_download_{id(edges)}"
+                )
+        
+        elif output_format == "GeoJSON":
+            geojson_str = edges.to_json()
+            st.download_button(
+                label="📥 Download Roads GeoJSON",
+                data=geojson_str,
+                file_name="roads.geojson",
+                mime="application/json"
+            )
+            
+            # Add cluster download if enabled
+            if enable_clustering and cluster_gdf is not None:
+                cluster_geojson_str = cluster_gdf.to_json()
+                st.download_button(
+                    label="📥 Download Cluster Polygons GeoJSON",
+                    data=cluster_geojson_str,
+                    file_name="clusters.geojson",
+                    mime="application/json",
+                    key=f"cluster_geojson_download_{id(edges)}"
+                )
+        
+        elif output_format == "GeoPackage":
+            gpkg_path = os.path.join(tmpdir, "roads.gpkg")
+            edges.to_file(gpkg_path, driver='GPKG', layer='roads')
+            
+            # Add clusters to same geopackage if enabled
+            if enable_clustering and cluster_gdf is not None:
+                cluster_gdf.to_file(gpkg_path, driver='GPKG', layer='clusters')
+            
+            with open(gpkg_path, 'rb') as f:
+                gpkg_bytes = f.read()
+            
+            download_label = "📥 Download GeoPackage"
+            if enable_clustering and cluster_gdf is not None:
+                download_label += " (Roads + Clusters)"
+            
+            st.download_button(
+                label=download_label,
+                data=gpkg_bytes,
+                file_name="roads.gpkg",
+                mime="application/geopackage+sqlite3"
+            )
+    
+    # Show attribute table sample
+    with st.expander("📊 View Attribute Table (first 10 rows)"):
+        display_cols = [col for col in edges.columns if col != 'geometry']
+        st.dataframe(edges[display_cols].head(10))
+    
+    return edges, cluster_gdf
 
 st.set_page_config(page_title="OSM Road Network Extractor", layout="wide")
 
@@ -28,6 +333,23 @@ network_type = st.sidebar.selectbox("Network Type:",
 
 output_format = st.sidebar.selectbox("Output Format:",
                                      ["GeoJSON", "Shapefile", "GeoPackage"])
+
+# Clustering options
+st.sidebar.markdown("---")
+st.sidebar.header("📊 Clustering Options")
+enable_clustering = st.sidebar.checkbox("Enable Road Network Clustering", value=False, 
+                                       help="Generate spatial clusters for dividing road networks")
+
+if enable_clustering:
+    point_spacing = st.sidebar.number_input("Point spacing (miles):", 
+                                           min_value=0.1, max_value=5.0, 
+                                           value=0.5, step=0.1,
+                                           help="Distance between points along roads")
+    
+    target_miles_per_cluster = st.sidebar.number_input("Target miles per cluster:", 
+                                                       min_value=1, max_value=1000, 
+                                                       value=50, step=5,
+                                                       help="Desired centerline miles in each cluster")
 
 # Main content area
 if extraction_method == "Place Name":
@@ -87,87 +409,14 @@ if extraction_method == "Place Name":
                         G = ox.graph_from_place(place_name, network_type=network_type)
                         nodes, edges = ox.graph_to_gdfs(G)
                     
-                    # Display stats
-                    st.success("✅ Network extracted successfully!")
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Nodes", f"{len(nodes):,}")
-                    col2.metric("Edges", f"{len(edges):,}")
-                    col3.metric("Total Length (km)", f"{edges['length'].sum()/1000:.2f}")
-                    
-                    # Create map
-                    st.subheader("Network Preview")
-                    map_center = [nodes.geometry.y.mean(), nodes.geometry.x.mean()]
-                    m = folium.Map(location=map_center, zoom_start=13)
-                    
-                    # Sample edges if too many (for performance)
-                    edges_to_plot = edges.sample(min(1000, len(edges)))
-                    
-                    # Add edges to map
-                    for idx, row in edges_to_plot.iterrows():
-                        coords = list(row.geometry.coords)
-                        folium.PolyLine(
-                            locations=[(coord[1], coord[0]) for coord in coords],
-                            color='blue',
-                            weight=2,
-                            opacity=0.6
-                        ).add_to(m)
-                    
-                    if len(edges) > 1000:
-                        st.info(f"📍 Showing 1,000 of {len(edges):,} edges for performance")
-                    
-                    folium_static(m, width=700, height=500)
-                    
-                    # Prepare download
-                    st.subheader("Download Your Data")
-                    
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        if output_format == "Shapefile":
-                            shp_path = os.path.join(tmpdir, "roads.shp")
-                            edges.to_file(shp_path, driver='ESRI Shapefile')
-                            
-                            # Zip the shapefile components
-                            zip_buffer = io.BytesIO()
-                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                                for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
-                                    file_path = os.path.join(tmpdir, f"roads{ext}")
-                                    if os.path.exists(file_path):
-                                        zipf.write(file_path, f"roads{ext}")
-                            
-                            zip_buffer.seek(0)
-                            st.download_button(
-                                label="📥 Download Shapefile (ZIP)",
-                                data=zip_buffer,
-                                file_name="roads.zip",
-                                mime="application/zip"
-                            )
-                        
-                        elif output_format == "GeoJSON":
-                            geojson_str = edges.to_json()
-                            st.download_button(
-                                label="📥 Download GeoJSON",
-                                data=geojson_str,
-                                file_name="roads.geojson",
-                                mime="application/json"
-                            )
-                        
-                        elif output_format == "GeoPackage":
-                            gpkg_path = os.path.join(tmpdir, "roads.gpkg")
-                            edges.to_file(gpkg_path, driver='GPKG')
-                            
-                            with open(gpkg_path, 'rb') as f:
-                                gpkg_bytes = f.read()
-                            
-                            st.download_button(
-                                label="📥 Download GeoPackage",
-                                data=gpkg_bytes,
-                                file_name="roads.gpkg",
-                                mime="application/geopackage+sqlite3"
-                            )
-                    
-                    # Show attribute table sample
-                    with st.expander("📊 View Attribute Table (first 10 rows)"):
-                        display_cols = [col for col in edges.columns if col != 'geometry']
-                        st.dataframe(edges[display_cols].head(10))
+                    # Process and display network
+                    process_and_display_network(
+                        edges, nodes, 
+                        enable_clustering=enable_clustering,
+                        target_miles_per_cluster=target_miles_per_cluster if enable_clustering else 50,
+                        point_spacing=point_spacing if enable_clustering else 0.5,
+                        output_format=output_format
+                    )
                 
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
@@ -214,95 +463,14 @@ elif extraction_method == "Bounding Box (Coordinates)":
                 G = ox.graph_from_bbox(north, south, east, west, network_type=network_type)
                 nodes, edges = ox.graph_to_gdfs(G)
                 
-                # Display stats
-                st.success("✅ Network extracted successfully!")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Nodes", f"{len(nodes):,}")
-                col2.metric("Edges", f"{len(edges):,}")
-                col3.metric("Total Length (km)", f"{edges['length'].sum()/1000:.2f}")
-                
-                # Create map
-                st.subheader("Network Preview")
-                map_center = [nodes.geometry.y.mean(), nodes.geometry.x.mean()]
-                m = folium.Map(location=map_center, zoom_start=13)
-                
-                # Add bounding box
-                folium.Rectangle(
-                    bounds=[[south, west], [north, east]],
-                    color='red',
-                    fill=False,
-                    weight=2
-                ).add_to(m)
-                
-                # Sample edges if too many (for performance)
-                edges_to_plot = edges.sample(min(1000, len(edges)))
-                
-                # Add edges to map
-                for idx, row in edges_to_plot.iterrows():
-                    coords = list(row.geometry.coords)
-                    folium.PolyLine(
-                        locations=[(coord[1], coord[0]) for coord in coords],
-                        color='blue',
-                        weight=2,
-                        opacity=0.6
-                    ).add_to(m)
-                
-                if len(edges) > 1000:
-                    st.info(f"📍 Showing 1,000 of {len(edges):,} edges for performance")
-                
-                folium_static(m, width=700, height=500)
-                
-                # Prepare download
-                st.subheader("Download Your Data")
-                
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    if output_format == "Shapefile":
-                        shp_path = os.path.join(tmpdir, "roads.shp")
-                        edges.to_file(shp_path, driver='ESRI Shapefile')
-                        
-                        # Zip the shapefile components
-                        zip_buffer = io.BytesIO()
-                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                            for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
-                                file_path = os.path.join(tmpdir, f"roads{ext}")
-                                if os.path.exists(file_path):
-                                    zipf.write(file_path, f"roads{ext}")
-                        
-                        zip_buffer.seek(0)
-                        st.download_button(
-                            label="📥 Download Shapefile (ZIP)",
-                            data=zip_buffer,
-                            file_name="roads.zip",
-                            mime="application/zip"
-                        )
-                    
-                    elif output_format == "GeoJSON":
-                        geojson_str = edges.to_json()
-                        st.download_button(
-                            label="📥 Download GeoJSON",
-                            data=geojson_str,
-                            file_name="roads.geojson",
-                            mime="application/json"
-                        )
-                    
-                    elif output_format == "GeoPackage":
-                        gpkg_path = os.path.join(tmpdir, "roads.gpkg")
-                        edges.to_file(gpkg_path, driver='GPKG')
-                        
-                        with open(gpkg_path, 'rb') as f:
-                            gpkg_bytes = f.read()
-                        
-                        st.download_button(
-                            label="📥 Download GeoPackage",
-                            data=gpkg_bytes,
-                            file_name="roads.gpkg",
-                            mime="application/geopackage+sqlite3"
-                        )
-                
-                # Show attribute table sample
-                with st.expander("📊 View Attribute Table (first 10 rows)"):
-                    display_cols = [col for col in edges.columns if col != 'geometry']
-                    st.dataframe(edges[display_cols].head(10))
+                # Process and display network
+                process_and_display_network(
+                    edges, nodes,
+                    enable_clustering=enable_clustering,
+                    target_miles_per_cluster=target_miles_per_cluster if enable_clustering else 50,
+                    point_spacing=point_spacing if enable_clustering else 0.5,
+                    output_format=output_format
+                )
             
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
@@ -355,96 +523,14 @@ elif extraction_method == "Upload Polygon":
                     G = ox.graph_from_polygon(polygon, network_type=network_type)
                     nodes, edges = ox.graph_to_gdfs(G)
                     
-                    # Display stats
-                    st.success("✅ Network extracted successfully!")
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Nodes", f"{len(nodes):,}")
-                    col2.metric("Edges", f"{len(edges):,}")
-                    col3.metric("Total Length (km)", f"{edges['length'].sum()/1000:.2f}")
-                    
-                    # Create map
-                    st.subheader("Network Preview")
-                    map_center = [nodes.geometry.y.mean(), nodes.geometry.x.mean()]
-                    m = folium.Map(location=map_center, zoom_start=13)
-                    
-                    # Add boundary to map
-                    folium.GeoJson(
-                        boundary,
-                        style_function=lambda x: {
-                            'fillColor': 'transparent',
-                            'color': 'red',
-                            'weight': 3
-                        }
-                    ).add_to(m)
-                    
-                    # Sample edges if too many
-                    edges_to_plot = edges.sample(min(1000, len(edges)))
-                    
-                    # Add edges to map
-                    for idx, row in edges_to_plot.iterrows():
-                        coords = list(row.geometry.coords)
-                        folium.PolyLine(
-                            locations=[(coord[1], coord[0]) for coord in coords],
-                            color='blue',
-                            weight=2,
-                            opacity=0.6
-                        ).add_to(m)
-                    
-                    if len(edges) > 1000:
-                        st.info(f"📍 Showing 1,000 of {len(edges):,} edges for performance")
-                    
-                    folium_static(m, width=700, height=500)
-                    
-                    # Prepare download
-                    st.subheader("Download Your Data")
-                    
-                    if output_format == "Shapefile":
-                        shp_path = os.path.join(tmpdir, "roads.shp")
-                        edges.to_file(shp_path, driver='ESRI Shapefile')
-                        
-                        # Zip the shapefile components
-                        zip_buffer = io.BytesIO()
-                        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                            for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
-                                file_path = os.path.join(tmpdir, f"roads{ext}")
-                                if os.path.exists(file_path):
-                                    zipf.write(file_path, f"roads{ext}")
-                        
-                        zip_buffer.seek(0)
-                        st.download_button(
-                            label="📥 Download Shapefile (ZIP)",
-                            data=zip_buffer,
-                            file_name="roads.zip",
-                            mime="application/zip"
-                        )
-                    
-                    elif output_format == "GeoJSON":
-                        geojson_str = edges.to_json()
-                        st.download_button(
-                            label="📥 Download GeoJSON",
-                            data=geojson_str,
-                            file_name="roads.geojson",
-                            mime="application/json"
-                        )
-                    
-                    elif output_format == "GeoPackage":
-                        gpkg_path = os.path.join(tmpdir, "roads.gpkg")
-                        edges.to_file(gpkg_path, driver='GPKG')
-                        
-                        with open(gpkg_path, 'rb') as f:
-                            gpkg_bytes = f.read()
-                        
-                        st.download_button(
-                            label="📥 Download GeoPackage",
-                            data=gpkg_bytes,
-                            file_name="roads.gpkg",
-                            mime="application/geopackage+sqlite3"
-                        )
-                    
-                    # Show attribute table sample
-                    with st.expander("📊 View Attribute Table (first 10 rows)"):
-                        display_cols = [col for col in edges.columns if col != 'geometry']
-                        st.dataframe(edges[display_cols].head(10))
+                    # Process and display network
+                    process_and_display_network(
+                        edges, nodes,
+                        enable_clustering=enable_clustering,
+                        target_miles_per_cluster=target_miles_per_cluster if enable_clustering else 50,
+                        point_spacing=point_spacing if enable_clustering else 0.5,
+                        output_format=output_format
+                    )
                     
             except Exception as e:
                 st.error(f"❌ Error: {str(e)}")
