@@ -74,9 +74,20 @@ def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
     Returns:
     - GeoDataFrame of cluster polygons
     """
+    # Validate we have enough points
+    if len(points_gdf) == 0:
+        raise ValueError("No points generated. Try reducing the point spacing distance.")
+    
+    if len(points_gdf) < n_clusters:
+        raise ValueError(f"Not enough points ({len(points_gdf)}) for {n_clusters} clusters. Try reducing point spacing or target miles per cluster.")
+    
     # Perform k-means clustering
     coords = np.array([[p.x, p.y] for p in points_gdf.geometry])
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    
+    # Adjust n_clusters if we have very few points
+    actual_clusters = min(n_clusters, len(points_gdf))
+    
+    kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=10)
     points_gdf['cluster'] = kmeans.fit_predict(coords)
     
     # Get cluster centroids
@@ -157,23 +168,38 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
     points_gdf = None
     if enable_clustering:
         with st.spinner("Generating cluster analysis..."):
-            # Calculate number of clusters
-            n_clusters = max(1, int(np.ceil(total_miles / target_miles_per_cluster)))
-            
-            st.info(f"📊 Generating {n_clusters} clusters (Target: {target_miles_per_cluster} miles/cluster)")
-            
-            # Generate points along lines
-            points_gdf = generate_points_along_lines(edges, spacing_miles=point_spacing)
-            
-            # Create cluster polygons
-            cluster_gdf, points_gdf = create_cluster_polygons(points_gdf, n_clusters, edges)
-            
-            # Display clustering stats
-            st.success(f"✅ Created {n_clusters} clusters")
-            
-            cluster_stats_display = st.expander("📈 View Cluster Statistics")
-            with cluster_stats_display:
-                st.dataframe(cluster_gdf[['cluster_id', 'total_miles']].sort_values('cluster_id'))
+            try:
+                # Calculate number of clusters
+                n_clusters = max(1, int(np.ceil(total_miles / target_miles_per_cluster)))
+                
+                st.info(f"📊 Generating {n_clusters} clusters (Target: {target_miles_per_cluster} miles/cluster)")
+                
+                # Generate points along lines
+                points_gdf = generate_points_along_lines(edges, spacing_miles=point_spacing)
+                
+                # Check if we have enough points
+                if len(points_gdf) == 0:
+                    st.warning(f"⚠️ No points generated with {point_spacing} mile spacing. Network may be too small or spacing too large. Try reducing point spacing.")
+                elif len(points_gdf) < n_clusters:
+                    st.warning(f"⚠️ Only {len(points_gdf)} points generated, but {n_clusters} clusters requested. Adjusting to {len(points_gdf)} clusters.")
+                    n_clusters = len(points_gdf)
+                
+                if len(points_gdf) >= 2:  # Need at least 2 points to cluster
+                    # Create cluster polygons
+                    cluster_gdf, points_gdf = create_cluster_polygons(points_gdf, n_clusters, edges)
+                    
+                    # Display clustering stats
+                    st.success(f"✅ Created {n_clusters} clusters")
+                    
+                    cluster_stats_display = st.expander("📈 View Cluster Statistics")
+                    with cluster_stats_display:
+                        st.dataframe(cluster_gdf[['cluster_id', 'total_miles']].sort_values('cluster_id'))
+                else:
+                    st.warning("⚠️ Not enough points for clustering. Continuing without clusters.")
+                    
+            except Exception as cluster_error:
+                st.warning(f"⚠️ Clustering failed: {str(cluster_error)}. Continuing without clusters.")
+                cluster_gdf = None
     
     # Create map
     st.subheader("Network Preview")
@@ -355,29 +381,28 @@ if enable_clustering:
 if extraction_method == "Place Name":
     st.subheader("Extract by Place Name")
     
-    st.info("💡 **Place Name Tips:** Be specific! Use format like 'City, State, Country' (e.g., 'Manhattan, New York, USA' or 'Downtown Los Angeles, California, USA')")
+    st.info("💡 **Place Name Tips:** Be specific! Use format like 'City, State, Country' (e.g., 'Los Angeles, California, USA' or 'South Central Los Angeles, California, USA')")
     
     place_name = st.text_input("Enter place name:", 
-                               placeholder="e.g., El Segundo, California, USA",
+                               placeholder="e.g., Compton, California, USA",
                                help="Format: City/Neighborhood, State, Country")
     
     # Add examples in an expander
     with st.expander("📝 See example place names that work well"):
         st.markdown("""
         **Cities:**
-        - `Manhattan, New York, USA`
-        - `San Francisco, California, USA`
+        - `San Luis Obispo, California, USA`
+        - `Compton, California, USA`
         - `Chicago, Illinois, USA`
         
         **Neighborhoods:**
-        - `Downtown Los Angeles, California, USA`
+        - `South Central Los Angeles, California, USA`
         - `Brooklyn Heights, New York, USA`
         - `Georgetown, Washington DC, USA`
         
         **Specific Areas:**
         - `UCLA, Los Angeles, California, USA`
         - `Golden Gate Park, San Francisco, California, USA`
-        - `Times Square, Manhattan, New York, USA`
         
         **Tips:**
         - Always include state/province and country
