@@ -36,12 +36,23 @@ def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
     points = []
     edge_ids = []
     
+    # Store original CRS
+    original_crs = edges_gdf.crs
+    
+    # Project to a meter-based CRS if needed (use UTM or local projection)
+    # For now, use Web Mercator (EPSG:3857) which is in meters
+    if edges_gdf.crs and edges_gdf.crs.to_epsg() == 4326:
+        # WGS84 (lat/lon) - need to reproject
+        edges_projected = edges_gdf.to_crs(epsg=3857)
+    else:
+        edges_projected = edges_gdf.copy()
+    
     # Convert miles to meters (1 mile = 1609.34 meters)
     spacing_meters = spacing_miles * 1609.34
     
-    for idx, row in edges_gdf.iterrows():
+    for idx, row in edges_projected.iterrows():
         line = row.geometry
-        line_length = line.length  # in meters
+        line_length = line.length  # in meters (now that we're projected)
         
         # Calculate number of points needed
         num_points = int(line_length / spacing_meters)
@@ -54,11 +65,22 @@ def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
                     points.append(point)
                     edge_ids.append(idx)
     
-    # Create GeoDataFrame
+    if len(points) == 0:
+        # Return empty GeoDataFrame with correct structure
+        return gpd.GeoDataFrame({
+            'edge_id': [],
+            'geometry': []
+        }, crs=original_crs)
+    
+    # Create GeoDataFrame in projected CRS
     points_gdf = gpd.GeoDataFrame({
         'edge_id': edge_ids,
         'geometry': points
-    }, crs=edges_gdf.crs)
+    }, crs=edges_projected.crs)
+    
+    # Reproject back to original CRS
+    if original_crs:
+        points_gdf = points_gdf.to_crs(original_crs)
     
     return points_gdf
 
@@ -79,16 +101,28 @@ def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
         raise ValueError("No points generated. Try reducing the point spacing distance.")
     
     if len(points_gdf) < n_clusters:
-        raise ValueError(f"Not enough points ({len(points_gdf)}) for {n_clusters} clusters. Try reducing point spacing or target miles per cluster.")
+        n_clusters = len(points_gdf)
     
-    # Perform k-means clustering
-    coords = np.array([[p.x, p.y] for p in points_gdf.geometry])
+    # Store original CRS
+    original_crs = points_gdf.crs
+    
+    # Project to meter-based CRS for clustering
+    if points_gdf.crs and points_gdf.crs.to_epsg() == 4326:
+        points_projected = points_gdf.to_crs(epsg=3857)
+        edges_projected = edges_gdf.to_crs(epsg=3857)
+    else:
+        points_projected = points_gdf.copy()
+        edges_projected = edges_gdf.copy()
+    
+    # Perform k-means clustering on projected coordinates
+    coords = np.array([[p.x, p.y] for p in points_projected.geometry])
     
     # Adjust n_clusters if we have very few points
-    actual_clusters = min(n_clusters, len(points_gdf))
+    actual_clusters = min(n_clusters, len(points_projected))
     
     kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=10)
-    points_gdf['cluster'] = kmeans.fit_predict(coords)
+    points_projected['cluster'] = kmeans.fit_predict(coords)
+    points_gdf['cluster'] = points_projected['cluster'].values
     
     # Get cluster centroids
     centroids = kmeans.cluster_centers_
@@ -100,8 +134,8 @@ def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
     polygons = []
     cluster_ids = []
     
-    # Get overall boundary
-    boundary = edges_gdf.unary_union.convex_hull.buffer(1000)  # 1km buffer
+    # Get overall boundary (use projected edges)
+    boundary = edges_projected.unary_union.convex_hull.buffer(1000)  # 1km buffer
     
     for region_idx, region in enumerate(vor.regions):
         if not region or -1 in region:
@@ -119,15 +153,19 @@ def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
                 polygons.append(clipped_poly)
                 cluster_ids.append(region_idx)
     
-    # Create GeoDataFrame
+    # Create GeoDataFrame in projected CRS
     cluster_gdf = gpd.GeoDataFrame({
         'cluster_id': cluster_ids,
         'geometry': polygons
-    }, crs=edges_gdf.crs)
+    }, crs=edges_projected.crs)
+    
+    # Reproject back to original CRS
+    if original_crs:
+        cluster_gdf = cluster_gdf.to_crs(original_crs)
     
     # Calculate stats for each cluster
     cluster_stats = []
-    for cluster_id in range(n_clusters):
+    for cluster_id in range(actual_clusters):
         cluster_points = points_gdf[points_gdf['cluster'] == cluster_id]
         cluster_edges = edges_gdf[edges_gdf.index.isin(cluster_points['edge_id'])]
         
@@ -381,28 +419,29 @@ if enable_clustering:
 if extraction_method == "Place Name":
     st.subheader("Extract by Place Name")
     
-    st.info("💡 **Place Name Tips:** Be specific! Use format like 'City, State, Country' (e.g., 'Los Angeles, California, USA' or 'South Central Los Angeles, California, USA')")
+    st.info("💡 **Place Name Tips:** Be specific! Use format like 'City, State, Country' (e.g., 'Manhattan, New York, USA' or 'Downtown Los Angeles, California, USA')")
     
     place_name = st.text_input("Enter place name:", 
-                               placeholder="e.g., Compton, California, USA",
+                               placeholder="e.g., El Segundo, California, USA",
                                help="Format: City/Neighborhood, State, Country")
     
     # Add examples in an expander
     with st.expander("📝 See example place names that work well"):
         st.markdown("""
         **Cities:**
-        - `San Luis Obispo, California, USA`
-        - `Compton, California, USA`
+        - `Manhattan, New York, USA`
+        - `San Francisco, California, USA`
         - `Chicago, Illinois, USA`
         
         **Neighborhoods:**
-        - `South Central Los Angeles, California, USA`
+        - `Downtown Los Angeles, California, USA`
         - `Brooklyn Heights, New York, USA`
         - `Georgetown, Washington DC, USA`
         
         **Specific Areas:**
         - `UCLA, Los Angeles, California, USA`
         - `Golden Gate Park, San Francisco, California, USA`
+        - `Times Square, Manhattan, New York, USA`
         
         **Tips:**
         - Always include state/province and country
