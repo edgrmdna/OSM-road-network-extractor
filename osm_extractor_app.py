@@ -18,7 +18,6 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from shapely.geometry import Point, MultiPoint
 from shapely.ops import unary_union
-from scipy.spatial import Voronoi
 from shapely.geometry import Polygon as ShapelyPolygon
 
 # Helper functions for road network analysis
@@ -127,31 +126,41 @@ def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
     # Get cluster centroids
     centroids = kmeans.cluster_centers_
     
-    # Create Voronoi diagram
-    vor = Voronoi(centroids)
-    
-    # Create polygons from Voronoi regions
+    # Create polygons for each cluster based on the actual roads in that cluster
     polygons = []
     cluster_ids = []
     
-    # Get overall boundary (use projected edges)
-    boundary = edges_projected.unary_union.convex_hull.buffer(1000)  # 1km buffer
-    
-    for region_idx, region in enumerate(vor.regions):
-        if not region or -1 in region:
+    for cluster_id in range(actual_clusters):
+        # Get all points in this cluster
+        cluster_points = points_projected[points_projected['cluster'] == cluster_id]
+        
+        if len(cluster_points) < 3:
             continue
         
-        # Create polygon from Voronoi vertices
-        polygon_coords = [vor.vertices[i] for i in region]
-        if len(polygon_coords) >= 3:
-            poly = ShapelyPolygon(polygon_coords)
+        # Get the edge IDs that belong to this cluster
+        cluster_edge_ids = cluster_points['edge_id'].unique()
+        cluster_edges = edges_projected[edges_projected.index.isin(cluster_edge_ids)]
+        
+        # Create a buffer around the roads in this cluster
+        # Merge all road geometries and create a convex hull or buffer
+        if len(cluster_edges) > 0:
+            # Option 1: Convex hull around all roads in cluster
+            all_coords = []
+            for idx, edge in cluster_edges.iterrows():
+                coords = list(edge.geometry.coords)
+                all_coords.extend(coords)
             
-            # Clip to boundary
-            clipped_poly = poly.intersection(boundary)
-            
-            if not clipped_poly.is_empty and clipped_poly.area > 0:
-                polygons.append(clipped_poly)
-                cluster_ids.append(region_idx)
+            if len(all_coords) >= 3:
+                # Create convex hull
+                from shapely.geometry import MultiPoint
+                multi_point = MultiPoint(all_coords)
+                cluster_polygon = multi_point.convex_hull
+                
+                # Add small buffer to make it look nicer
+                cluster_polygon = cluster_polygon.buffer(100)  # 100 meter buffer
+                
+                polygons.append(cluster_polygon)
+                cluster_ids.append(cluster_id)
     
     # Create GeoDataFrame in projected CRS
     cluster_gdf = gpd.GeoDataFrame({
@@ -193,6 +202,10 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
     edges['length_mi'] = edges['length'] / 1609.34
     total_miles = edges['length_mi'].sum()
     
+    # Store in session state for persistent downloads
+    st.session_state.edges = edges
+    st.session_state.nodes = nodes
+    
     # Display stats
     st.success("✅ Network extracted successfully!")
     col1, col2, col3, col4 = st.columns(4)
@@ -226,6 +239,9 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
                     # Create cluster polygons
                     cluster_gdf, points_gdf = create_cluster_polygons(points_gdf, n_clusters, edges)
                     
+                    # Store in session state
+                    st.session_state.cluster_gdf = cluster_gdf
+                    
                     # Display clustering stats
                     st.success(f"✅ Created {n_clusters} clusters")
                     
@@ -234,10 +250,14 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
                         st.dataframe(cluster_gdf[['cluster_id', 'total_miles']].sort_values('cluster_id'))
                 else:
                     st.warning("⚠️ Not enough points for clustering. Continuing without clusters.")
+                    st.session_state.cluster_gdf = None
                     
             except Exception as cluster_error:
                 st.warning(f"⚠️ Clustering failed: {str(cluster_error)}. Continuing without clusters.")
                 cluster_gdf = None
+                st.session_state.cluster_gdf = None
+    else:
+        st.session_state.cluster_gdf = None
     
     # Create map
     st.subheader("Network Preview")
@@ -286,10 +306,14 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
     # Prepare download
     st.subheader("Download Your Data")
     
+    # Use data from session state (persists across reruns)
+    download_edges = st.session_state.edges if st.session_state.edges is not None else edges
+    download_cluster_gdf = st.session_state.cluster_gdf
+    
     with tempfile.TemporaryDirectory() as tmpdir:
         if output_format == "Shapefile":
             shp_path = os.path.join(tmpdir, "roads.shp")
-            edges.to_file(shp_path, driver='ESRI Shapefile')
+            download_edges.to_file(shp_path, driver='ESRI Shapefile')
             
             # Zip the shapefile components
             zip_buffer = io.BytesIO()
@@ -304,13 +328,14 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
                 label="📥 Download Roads Shapefile (ZIP)",
                 data=zip_buffer,
                 file_name="roads.zip",
-                mime="application/zip"
+                mime="application/zip",
+                key="roads_shp"
             )
             
             # Add cluster download if enabled
-            if enable_clustering and cluster_gdf is not None:
+            if enable_clustering and download_cluster_gdf is not None:
                 cluster_shp_path = os.path.join(tmpdir, "clusters.shp")
-                cluster_gdf.to_file(cluster_shp_path, driver='ESRI Shapefile')
+                download_cluster_gdf.to_file(cluster_shp_path, driver='ESRI Shapefile')
                 
                 cluster_zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(cluster_zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -325,49 +350,51 @@ def process_and_display_network(edges, nodes, enable_clustering=False,
                     data=cluster_zip_buffer,
                     file_name="clusters.zip",
                     mime="application/zip",
-                    key=f"cluster_shp_download_{id(edges)}"
+                    key="clusters_shp"
                 )
         
         elif output_format == "GeoJSON":
-            geojson_str = edges.to_json()
+            geojson_str = download_edges.to_json()
             st.download_button(
                 label="📥 Download Roads GeoJSON",
                 data=geojson_str,
                 file_name="roads.geojson",
-                mime="application/json"
+                mime="application/json",
+                key="roads_geojson"
             )
             
             # Add cluster download if enabled
-            if enable_clustering and cluster_gdf is not None:
-                cluster_geojson_str = cluster_gdf.to_json()
+            if enable_clustering and download_cluster_gdf is not None:
+                cluster_geojson_str = download_cluster_gdf.to_json()
                 st.download_button(
                     label="📥 Download Cluster Polygons GeoJSON",
                     data=cluster_geojson_str,
                     file_name="clusters.geojson",
                     mime="application/json",
-                    key=f"cluster_geojson_download_{id(edges)}"
+                    key="clusters_geojson"
                 )
         
         elif output_format == "GeoPackage":
             gpkg_path = os.path.join(tmpdir, "roads.gpkg")
-            edges.to_file(gpkg_path, driver='GPKG', layer='roads')
+            download_edges.to_file(gpkg_path, driver='GPKG', layer='roads')
             
             # Add clusters to same geopackage if enabled
-            if enable_clustering and cluster_gdf is not None:
-                cluster_gdf.to_file(gpkg_path, driver='GPKG', layer='clusters')
+            if enable_clustering and download_cluster_gdf is not None:
+                download_cluster_gdf.to_file(gpkg_path, driver='GPKG', layer='clusters')
             
             with open(gpkg_path, 'rb') as f:
                 gpkg_bytes = f.read()
             
             download_label = "📥 Download GeoPackage"
-            if enable_clustering and cluster_gdf is not None:
+            if enable_clustering and download_cluster_gdf is not None:
                 download_label += " (Roads + Clusters)"
             
             st.download_button(
                 label=download_label,
                 data=gpkg_bytes,
                 file_name="roads.gpkg",
-                mime="application/geopackage+sqlite3"
+                mime="application/geopackage+sqlite3",
+                key="roads_gpkg"
             )
     
     # Show attribute table sample
@@ -382,6 +409,14 @@ st.set_page_config(page_title="OSM Road Network Extractor", layout="wide")
 # Configure OSMnx
 ox.settings.use_cache = True
 ox.settings.log_console = False
+
+# Initialize session state for persistent data
+if 'edges' not in st.session_state:
+    st.session_state.edges = None
+if 'nodes' not in st.session_state:
+    st.session_state.nodes = None
+if 'cluster_gdf' not in st.session_state:
+    st.session_state.cluster_gdf = None
 
 st.title("🗺️ OpenStreetMap Road Network Extractor")
 st.markdown("Extract road networks by place name or upload a boundary polygon")
