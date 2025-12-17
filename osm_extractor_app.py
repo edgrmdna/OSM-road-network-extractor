@@ -34,6 +34,7 @@ def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
     """
     points = []
     edge_ids = []
+    edge_lengths = []  # Store the length of each edge for weighting
     
     # Store original CRS
     original_crs = edges_gdf.crs
@@ -52,6 +53,7 @@ def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
     for idx, row in edges_projected.iterrows():
         line = row.geometry
         line_length = line.length  # in meters (now that we're projected)
+        line_length_mi = line_length / 1609.34
         
         # Calculate number of points needed
         num_points = int(line_length / spacing_meters)
@@ -63,17 +65,20 @@ def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
                     point = line.interpolate(distance)
                     points.append(point)
                     edge_ids.append(idx)
+                    edge_lengths.append(line_length_mi)  # Store edge length for weighting
     
     if len(points) == 0:
         # Return empty GeoDataFrame with correct structure
         return gpd.GeoDataFrame({
             'edge_id': [],
+            'edge_length_mi': [],
             'geometry': []
         }, crs=original_crs)
     
     # Create GeoDataFrame in projected CRS
     points_gdf = gpd.GeoDataFrame({
         'edge_id': edge_ids,
+        'edge_length_mi': edge_lengths,
         'geometry': points
     }, crs=edges_projected.crs)
     
@@ -85,7 +90,7 @@ def generate_points_along_lines(edges_gdf, spacing_miles=0.5):
 
 def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
     """
-    Create polygons around clustered points using Voronoi diagrams.
+    Create polygons around clustered points using a balanced approach.
     
     Parameters:
     - points_gdf: GeoDataFrame of points
@@ -116,12 +121,53 @@ def create_cluster_polygons(points_gdf, n_clusters, edges_gdf):
     # Perform k-means clustering on projected coordinates
     coords = np.array([[p.x, p.y] for p in points_projected.geometry])
     
+    # Create sample weights based on edge length (longer roads get more weight)
+    # This helps balance the mileage across clusters
+    sample_weights = points_projected['edge_length_mi'].values
+    
     # Adjust n_clusters if we have very few points
     actual_clusters = min(n_clusters, len(points_projected))
     
-    kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=10)
-    points_projected['cluster'] = kmeans.fit_predict(coords)
+    # Use k-means with sample weights to bias toward balanced mileage
+    kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=50, max_iter=1000)
+    
+    # Weighted clustering - duplicate points based on their road length
+    # This is a trick to make k-means consider road mileage
+    weighted_coords = []
+    weighted_point_indices = []
+    for i, (coord, weight) in enumerate(zip(coords, sample_weights)):
+        # Duplicate points proportional to their weight (road length)
+        num_duplicates = max(1, int(weight * 10))  # Scale weight
+        for _ in range(num_duplicates):
+            weighted_coords.append(coord)
+            weighted_point_indices.append(i)
+    
+    weighted_coords = np.array(weighted_coords)
+    
+    # Cluster the weighted points
+    weighted_clusters = kmeans.fit_predict(weighted_coords)
+    
+    # Map back to original points (take mode of cluster assignments)
+    from scipy import stats
+    point_clusters = np.zeros(len(points_projected), dtype=int)
+    for i in range(len(points_projected)):
+        point_indices = [idx for idx, p_idx in enumerate(weighted_point_indices) if p_idx == i]
+        if point_indices:
+            point_clusters[i] = stats.mode([weighted_clusters[idx] for idx in point_indices], keepdims=True).mode[0]
+    
+    points_projected['cluster'] = point_clusters
     points_gdf['cluster'] = points_projected['cluster'].values
+    
+    # Check cluster balance and potentially reassign
+    # Calculate miles per cluster
+    cluster_miles = {}
+    for cluster_id in range(actual_clusters):
+        cluster_points = points_gdf[points_gdf['cluster'] == cluster_id]
+        cluster_edge_ids = cluster_points['edge_id'].unique()
+        cluster_edges = edges_gdf[edges_gdf.index.isin(cluster_edge_ids)]
+        cluster_miles[cluster_id] = cluster_edges['length_mi'].sum() if 'length_mi' in cluster_edges.columns else 0
+    
+    st.info(f"Initial cluster distribution: {[f'{cluster_miles[i]:.1f}mi' for i in range(actual_clusters)]}")
     
     # Get cluster centroids
     centroids = kmeans.cluster_centers_
@@ -457,21 +503,19 @@ if extraction_method == "Place Name":
     st.info("💡 **Place Name Tips:** Be specific! Use format like 'City, State, Country' (e.g., 'Manhattan, New York, USA' or 'Downtown Los Angeles, California, USA')")
     
     place_name = st.text_input("Enter place name:", 
-                               placeholder="e.g., El Segundo, California, USA",
+                               placeholder="e.g., Compton, California, USA",
                                help="Format: City/Neighborhood, State, Country")
     
     # Add examples in an expander
     with st.expander("📝 See example place names that work well"):
         st.markdown("""
         **Cities:**
-        - `Manhattan, New York, USA`
-        - `San Francisco, California, USA`
-        - `Chicago, Illinois, USA`
+        - `Compton, California, USA`
+        - `Oakland, California, USA`
         
         **Neighborhoods:**
-        - `Downtown Los Angeles, California, USA`
+        - `South Central Los Angeles, California, USA`
         - `Brooklyn Heights, New York, USA`
-        - `Georgetown, Washington DC, USA`
         
         **Specific Areas:**
         - `UCLA, Los Angeles, California, USA`
